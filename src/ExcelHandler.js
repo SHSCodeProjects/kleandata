@@ -1,15 +1,29 @@
 import React, { useState, useRef } from 'react';
 import ExcelJS from 'exceljs';
+import axios from 'axios';
 import {
   Button, IconButton, Tabs, Tab, Box, Paper, Table, TableHead, TableRow, TableCell, TableBody, Tooltip, TextField, Dialog, DialogTitle, DialogContent, DialogActions, Select, MenuItem,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
-import MergeIcon from '@mui/icons-material/Merge';
-import AddIcon from '@mui/icons-material/Add';
+import MergeTypeIcon from '@mui/icons-material/MergeType';
+import AddCircleIcon from '@mui/icons-material/AddCircle';
+import SearchIcon from '@mui/icons-material/Search';
+
+// Check if running in Electron
+const isElectron = () => {
+  return window && window.process && window.process.type;
+};
+
+// Import shell from electron if running in Electron
+let shell;
+if (isElectron()) {
+  shell = window.require('electron').shell;
+}
 
 const ExcelHandler = () => {
   const [workbook, setWorkbook] = useState(null);
   const [data, setData] = useState([]);
+  const [filteredData, setFilteredData] = useState([]);
   const [selectedSheet, setSelectedSheet] = useState(0);
   const [editCell, setEditCell] = useState({ rowIndex: null, columnKey: null, value: '' });
   const [newRow, setNewRow] = useState({});
@@ -21,6 +35,7 @@ const ExcelHandler = () => {
   const [selectedManualRow, setSelectedManualRow] = useState(null);
   const [undoStack, setUndoStack] = useState([]);
   const [isUndoDisabled, setIsUndoDisabled] = useState(true);
+  const [searchText, setSearchText] = useState('');
   const tableRef = useRef(null);
 
   const handleFileUpload = async (event) => {
@@ -36,17 +51,19 @@ const ExcelHandler = () => {
     reader.readAsArrayBuffer(file);
   };
 
-  const loadSheetData = (sheet) => {
-    const headers = sheet.getRow(1).values.slice(1); // Ignore first element
-    const jsonData = sheet.getSheetValues().slice(2).map((row) => {
-      const rowData = {};
-      headers.forEach((header, i) => {
-        rowData[header] = row[i + 1];
-      });
-      return rowData;
+const loadSheetData = (sheet) => {
+  const headers = sheet.getRow(1).values.slice(1); // Ignore first element
+  const jsonData = sheet.getSheetValues().slice(2).map((row) => {
+    const rowData = {};
+    headers.forEach((header, i) => {
+      rowData[header] = row[i + 1];
     });
-    setData(jsonData);
-  };
+    return rowData;
+  }).filter(row => Object.values(row).some(cell => cell !== null && cell !== undefined && cell !== '')); // Filter out empty rows
+  setData(jsonData);
+  setFilteredData(jsonData);
+};
+
 
   const handleSheetChange = (event, newValue) => {
     setSelectedSheet(newValue);
@@ -54,13 +71,82 @@ const ExcelHandler = () => {
     loadSheetData(sheet);
   };
 
-  const deleteRow = (index) => {
+  const deleteRow = async (index) => {
+    console.log('Deleting row:', index);
+    const rowToDelete = filteredData[index];
+    const fullName = `${rowToDelete.firstName} ${rowToDelete.lastName}`.trim().toLowerCase();
+
+    if (!fullName) {
+      console.error('Full name is undefined or empty. Row to delete:', rowToDelete);
+      return;
+    }
+
+    console.log('Full name of the row to delete:', fullName);
+
     const updatedData = data.filter((_, i) => i !== index);
-    setUndoStack([...undoStack, { type: 'delete', data: data[index], index, sheetIndex: selectedSheet }]);
+    setUndoStack([...undoStack, { type: 'delete', data: rowToDelete, index, sheetIndex: selectedSheet }]);
     setData(updatedData);
+    setFilteredData(updatedData);
+
     const sheet = workbook.worksheets[selectedSheet];
-    sheet.spliceRows(index + 2, 1);
+    sheet.spliceRows(index + 2, 1); // Adjust for 1-based indexing
+    console.log('Deleted row from current sheet');
+
+    const deletedInTarget = await synchronizeDeleteAcrossTabs(fullName, selectedSheet);
+    if (!deletedInTarget) {
+      console.log('Record not found in target sheet. Deleted from parent sheet only.');
+    }
+
     setIsUndoDisabled(false);
+  };
+
+  const synchronizeDeleteAcrossTabs = async (fullName, originatingSheetIndex) => {
+    console.log('Synchronizing deletion across tabs for:', fullName, 'from sheet index:', originatingSheetIndex);
+
+    const targetSheetIndex = originatingSheetIndex % 2 === 0 ? originatingSheetIndex + 1 : originatingSheetIndex - 1;
+    if (targetSheetIndex >= workbook.worksheets.length || targetSheetIndex < 0) {
+      console.log('No corresponding sheet to synchronize with.');
+      return;
+    }
+
+    const targetSheet = workbook.worksheets[targetSheetIndex];
+    let rowIndexToDelete = [];
+
+    const targetHeaders = targetSheet.getRow(1).values.slice(1);
+    const fullNameIndex = targetHeaders.indexOf('fullName') + 1;
+
+    if (fullNameIndex === 0) {
+      console.error('fullName column not found in target sheet');
+      return;
+    }
+
+    targetSheet.eachRow((row, rowIndex) => {
+      const rowFullName = row.getCell(fullNameIndex).value?.toString().trim().toLowerCase();
+      if (rowFullName === fullName) {
+        console.log(`Found matching row in target sheet at index: ${rowIndex} with full name: ${rowFullName}`);
+        rowIndexToDelete.push(rowIndex);
+      }
+    });
+
+    if (rowIndexToDelete.length === 0) {
+      console.log('No matching row found in target sheet');
+      return false;
+    }
+
+    console.log('Row indices to delete in target sheet:', rowIndexToDelete);
+
+    rowIndexToDelete.reverse().forEach((rowIndex) => {
+      const deletedRow = targetSheet.getRow(rowIndex);
+      console.log(`Deleting row at index: ${rowIndex} in target sheet with data:`, deletedRow.values);
+      targetSheet.spliceRows(rowIndex, 1);
+      console.log('Deleted row at index:', rowIndex, 'in target sheet');
+    });
+
+    return true;
+  };
+
+  const handleDeleteRow = (index) => {
+    deleteRow(index);
   };
 
   const handleMergeClick = (rowIndex) => {
@@ -129,11 +215,13 @@ const ExcelHandler = () => {
 
     const updatedData = data.filter((_, i) => i !== currentRowIndex);
     setData(updatedData);
+    setFilteredData(updatedData);
     workbook.worksheets[selectedSheet].spliceRows(currentRowIndex + 2, 1);
     setIsUndoDisabled(false);
   };
 
   const handleCellDoubleClick = (rowIndex, columnKey, value) => {
+    console.log('Cell double-clicked:', { rowIndex, columnKey, value });
     setEditCell({ rowIndex, columnKey, value });
   };
 
@@ -141,36 +229,44 @@ const ExcelHandler = () => {
     setEditCell({ ...editCell, value: event.target.value });
   };
 
-  const handleEditSave = () => {
+  const handleEditSave = async () => {
+    console.log('Saving edit:', editCell);
     const updatedData = data.map((row, rowIndex) =>
       rowIndex === editCell.rowIndex ? { ...row, [editCell.columnKey]: editCell.value } : row
     );
-    setUndoStack([...undoStack, { type: 'edit', data: data[editCell.rowIndex], rowIndex: editCell.rowIndex, sheetIndex: selectedSheet }]);
     setData(updatedData);
+    setFilteredData(updatedData);
+
     const sheet = workbook.worksheets[selectedSheet];
-    const row = sheet.getRow(editCell.rowIndex + 2);
-    const columnIndex = sheet.getRow(1).values.indexOf(editCell.columnKey) + 1;
-    row.getCell(columnIndex).value = editCell.value;
+    const headers = sheet.getRow(1).values.slice(1); // Get headers
+    const columnIndex = headers.indexOf(editCell.columnKey) + 1; // Find correct column index
+    const row = sheet.getRow(editCell.rowIndex + 2); // Get the correct row
+    console.log('Updating sheet:', { rowIndex: editCell.rowIndex + 2, columnIndex, value: editCell.value });
+    row.getCell(columnIndex).value = editCell.value; // Correctly update the cell value
+    row.commit(); // Ensure changes are committed to the workbook
+
     setEditCell({ rowIndex: null, columnKey: null, value: '' });
     setIsUndoDisabled(false);
   };
 
-  const handleNewRowSave = () => {
+  const handleNewRowSave = async () => {
+    console.log('Saving new row:', newRow);
     const headers = workbook.worksheets[selectedSheet].getRow(1).values.slice(1);
     const newRowData = headers.reduce((acc, header) => {
       acc[header] = newRow[header] || '';
       return acc;
     }, {});
-    setNewRow(newRowData);
     const updatedData = [...data, newRowData];
     setData(updatedData);
+    setFilteredData(updatedData);
     const sheet = workbook.worksheets[selectedSheet];
     sheet.addRow(newRowData).commit();
     setNewRow({});
     setIsUndoDisabled(false);
   };
 
-  const handleSaveFile = async () => {
+  const saveFile = async () => {
+    console.log('Saving file');
     const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const link = document.createElement('a');
@@ -180,7 +276,14 @@ const ExcelHandler = () => {
   };
 
   const handlePushToDB = async () => {
-    console.log('Push to DB functionality to be implemented');
+    const filteredData = data.filter(row => row.email && row['Phone Number 1']);
+    try {
+      console.log('Data to be pushed:', filteredData);
+      const response = await axios.post('http://localhost:3001/api/pushToDB', filteredData);
+      console.log(response.data);
+    } catch (error) {
+      console.error('Error pushing data to DB: ', error);
+    }
   };
 
   const handleManualSelect = async () => {
@@ -225,12 +328,14 @@ const ExcelHandler = () => {
 
     const updatedData = data.filter((_, index) => !rowsToDelete.includes(index));
     setData(updatedData);
+    setFilteredData(updatedData);
 
     loadSheetData(workbook.worksheets[selectedSheet]);
     setIsUndoDisabled(false);
   };
 
-  const handleUndo = () => {
+  const handleUndo = async () => {
+    console.log('Undoing last action');
     const lastAction = undoStack.pop();
     if (!lastAction) return;
 
@@ -240,12 +345,14 @@ const ExcelHandler = () => {
         const restoredData = [...data];
         restoredData.splice(lastAction.index, 0, lastAction.data);
         setData(restoredData);
+        setFilteredData(restoredData);
         sheet.insertRow(lastAction.index + 2, lastAction.data);
         break;
       case 'edit':
         const editedData = [...data];
         editedData[lastAction.rowIndex] = lastAction.data;
         setData(editedData);
+        setFilteredData(editedData);
         const row = sheet.getRow(lastAction.rowIndex + 2);
         Object.entries(lastAction.data).forEach(([key, value]) => {
           const columnIndex = sheet.getRow(1).values.indexOf(key) + 1;
@@ -260,6 +367,7 @@ const ExcelHandler = () => {
         });
         const targetData = [...data, newRowValues];
         setData(targetData);
+        setFilteredData(targetData);
         break;
       default:
         break;
@@ -269,13 +377,34 @@ const ExcelHandler = () => {
     setIsUndoDisabled(true);
   };
 
+  const openLinkInPopup = (url) => {
+    if (isElectron() && shell) {
+      shell.openExternal(url);
+    } else {
+      const popup = window.open(url, '_blank', 'toolbar=0,location=0,menubar=0,width=800,height=600');
+      if (popup) {
+        popup.focus();
+      }
+    }
+  };
+
+  const handleSearch = (e) => {
+    const searchValue = e.target.value.toLowerCase();
+    setSearchText(searchValue);
+    setFilteredData(data.filter(row =>
+      Object.values(row).some(value =>
+        value?.toString().toLowerCase().includes(searchValue)
+      )
+    ));
+  };
+
   return (
     <Box sx={{ bgcolor: 'background.default', color: 'text.primary', minHeight: '100vh', p: 2 }} ref={tableRef}>
       <input type="file" onChange={handleFileUpload} />
       {workbook && (
         <>
           <Button onClick={handlePushToDB} variant="contained" sx={{ mt: 2, mr: 2 }}>Push to DB</Button>
-          <Button onClick={handleSaveFile} variant="contained" sx={{ mt: 2, mr: 2 }}>Save File</Button>
+          <Button onClick={saveFile} variant="contained" sx={{ mt: 2, mr: 2 }}>Save File</Button>
           <Button onClick={handleMergeAll} variant="contained" sx={{ mt: 2, mr: 2 }}>Merge All</Button>
           <Button onClick={handleUndo} variant="contained" sx={{ mt: 2 }} disabled={isUndoDisabled}>Undo</Button>
           <Tabs value={selectedSheet} onChange={handleSheetChange} variant="scrollable" scrollButtons="auto">
@@ -283,6 +412,14 @@ const ExcelHandler = () => {
               <Tab label={sheet.name} key={index} />
             ))}
           </Tabs>
+          <Box sx={{ display: 'flex', alignItems: 'center', mt: 2 }}>
+            <SearchIcon sx={{ mr: 2 }} />
+            <TextField
+              placeholder="Search..."
+              value={searchText}
+              onChange={handleSearch}
+            />
+          </Box>
           <Paper sx={{ mt: 2, height: '70vh', overflow: 'auto' }}>
             <Table stickyHeader>
               <TableHead>
@@ -293,14 +430,14 @@ const ExcelHandler = () => {
                   <TableCell sx={{ position: 'sticky', top: 0, zIndex: 3, backgroundColor: '#b8860b', color: 'black', fontWeight: 'bold' }}>
                     <Tooltip title="Add New Row">
                       <IconButton onClick={handleNewRowSave}>
-                        <AddIcon />
+                        <AddCircleIcon />
                       </IconButton>
                     </Tooltip>
                   </TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {data.map((row, rowIndex) => (
+                {filteredData.map((row, rowIndex) => (
                   <TableRow key={rowIndex}>
                     {Object.entries(row).map(([key, value], columnIndex) => (
                       <TableCell
@@ -321,7 +458,8 @@ const ExcelHandler = () => {
                             : {
                                 whiteSpace: 'nowrap',
                                 overflow: 'hidden',
-                                textOverflow: 'ellipsis'
+                                textOverflow: 'ellipsis',
+                                color: typeof value === 'string' && value.startsWith('http') ? 'white' : 'inherit'
                               }
                         }
                         onDoubleClick={() => handleCellDoubleClick(rowIndex, key, value)}
@@ -333,9 +471,13 @@ const ExcelHandler = () => {
                             onBlur={handleEditSave}
                             autoFocus
                           />
-                        ) : typeof value === 'object' && value !== null && 'text' in value ? (
-                          <a href={value.hyperlink} target="_blank" rel="noopener noreferrer" style={{ color: 'black', textDecoration: 'none', fontSize: 'small' }}>
-                            {value.text}
+                        ) : typeof value === 'string' && value.startsWith('http') ? (
+                          <a
+                            href="#"
+                            onClick={() => openLinkInPopup(value)}
+                            style={{ color: 'white', textDecoration: 'underline' }}
+                          >
+                            {value}
                           </a>
                         ) : (
                           value
@@ -356,13 +498,13 @@ const ExcelHandler = () => {
                       }}
                     >
                       <Tooltip title="Delete">
-                        <IconButton onClick={() => deleteRow(rowIndex)}>
+                        <IconButton onClick={() => handleDeleteRow(rowIndex)}>
                           <DeleteIcon />
                         </IconButton>
                       </Tooltip>
                       <Tooltip title="Merge">
                         <IconButton onClick={() => handleMergeClick(rowIndex)}>
-                          <MergeIcon />
+                          <MergeTypeIcon />
                         </IconButton>
                       </Tooltip>
                     </TableCell>
@@ -384,7 +526,7 @@ const ExcelHandler = () => {
                   <TableCell>
                     <Tooltip title="Add New Row">
                       <IconButton onClick={handleNewRowSave}>
-                        <AddIcon />
+                        <AddCircleIcon />
                       </IconButton>
                     </Tooltip>
                   </TableCell>
@@ -437,8 +579,3 @@ const ExcelHandler = () => {
 };
 
 export default ExcelHandler;
-
-
-
-// C:\Users\Jude.Adenuga\kleandata\node_modules\electron\dist\electron.exe C:\Users\Jude.Adenuga\kleandata\public\main.js
-// npx wait-on http://localhost:3000; npx electron
